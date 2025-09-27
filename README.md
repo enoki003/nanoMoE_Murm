@@ -6,7 +6,7 @@
 The simplest, fastest repository for training/finetuning medium-sized MoE-based GPTs.
 This is a fork of [Andrej Karphathy](https://karpathy.ai/)'s [nanoGPT](https://github.com/karpathy/nanoGPT) repository, which is a simple but functional implementation of GPT-2 pretraining.
 nanoMoE edits the functionality of nanoGPT to support training of both standard (decoder-only) LLMs and MoE-based architectures, including all necessary stability tricks for training MoEs (e.g., auxiliary losses, proper weight initialization, mixed precision, etc.).
-See the related [blog post](https://cameronrwolfe.substack.com/nano-moe) for full details on nanoMoE. 
+See the related [blog post](https://cameronrwolfe.substack.com/nano-moe) for full details on nanoMoE.
 
 ![repro124m](assets/moe-loss.png)
 
@@ -17,7 +17,7 @@ Because the code is so simple, it is very easy to hack to your needs, train new 
 
 ## install
 
-```
+```sh
 pip install torch numpy transformers datasets tiktoken wandb tqdm
 ```
 
@@ -25,11 +25,11 @@ Dependencies:
 
 - [pytorch](https://pytorch.org) <3
 - [numpy](https://numpy.org/install/) <3
--  `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
--  `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
--  `tiktoken` for OpenAI's fast BPE code <3
--  `wandb` for optional logging <3
--  `tqdm` for progress bars <3
+- `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
+- `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
+- `tiktoken` for OpenAI's fast BPE code <3
+- `wandb` for optional logging <3
+- `tqdm` for progress bars <3
 
 ## quick start
 
@@ -38,7 +38,7 @@ The full pretraining script trains nanoMoE, a 6-layer MoE-based decoder-only tra
 If you have access to more GPUs, you can scale down `gradient_accumulation_steps` and scale up the `batch_size` accordingly.
 You can also scale up `max_iters` to increase the number of tokens on which nanoMoE is trained.
 
-#### Prepare OpenWebText
+### Prepare OpenWebText
 
 We first tokenize the dataset, in this case the [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/), an open reproduction of OpenAI's (private) WebText used to train GPT-2:
 
@@ -46,7 +46,30 @@ We first tokenize the dataset, in this case the [OpenWebText](https://openwebtex
 python data/openwebtext/prepare.py
 ```
 
-This downloads and tokenizes the [OpenWebText](https://huggingface.co/datasets/openwebtext) dataset. It will create a `train.bin` and `val.bin` which holds the GPT2 BPE token ids in one sequence, stored as raw uint16 bytes.
+The script will attempt several OpenWebText mirrors automatically:
+
+- A classic raw-text mirror (default: `Skylion007/openwebtext`).
+- A fully public, pre-tokenised dump (`NeelNanda/openwebtext-tokenized-9b`) if the raw mirror is unavailable.
+
+You can customise the behaviour either with CLI flags or environment variables:
+
+| purpose | CLI flag | env var | default |
+| --- | --- | --- | --- |
+| Primary dataset repo id | `--dataset-id` | `OPENWEBTEXT_DATASET` | `Skylion007/openwebtext` |
+| Fallback dataset repo id | `--fallback-id` | `OPENWEBTEXT_FALLBACK` | `NeelNanda/openwebtext-tokenized-9b` |
+| Hugging Face access token | `--hf-token` | `HF_TOKEN` | _unset_ |
+| Validation split ratio | `--val-ratio` | `OPENWEBTEXT_VAL_RATIO` | `0.0005` |
+| Map workers (tokenisation) | `--num-proc` | `OPENWEBTEXT_NUM_PROC` | `8` |
+| Load workers (download stage) | `--num-proc-load` | `OPENWEBTEXT_NUM_PROC_LOAD` | matches `--num-proc` |
+
+If you have a Hugging Face token, export it before running to unlock the gated mirrors:
+
+```powershell
+$env:HF_TOKEN = "hf_xxx"
+python data/openwebtext/prepare.py
+```
+
+For quick smoke tests you can cap the processed documents with `--max-docs N`. The script will create `train.bin` and `val.bin` containing GPT-2 BPE token ids stored as contiguous `uint16` arrays, identical to the historical nanoGPT preprocessing step.
 
 #### Run Pretraining
 
@@ -56,7 +79,7 @@ Then we're ready to kick off training. To reproduce nanoMoE, you'll want to run:
 torchrun --standalone --nproc_per_node=2 train.py config/train_nano_moe.py
 ```
 
-This will run for about 5 days using PyTorch Distributed Data Parallel (DDP) and go down to loss of ~3.35. Now, a GPT-2 model just evaluated on OWT gets a val loss of about 3.11, but if you finetune it it will come down to ~2.85 territory (due to an apparent domain gap). The slightly higher loss of nanoMoE is likely due to the fact that the model was made smaller to fit within a commodity (RTX 3090) GPU setup. 
+This will run for about 5 days using PyTorch Distributed Data Parallel (DDP) and go down to loss of ~3.35. Now, a GPT-2 model just evaluated on OWT gets a val loss of about 3.11, but if you finetune it it will come down to ~2.85 territory (due to an apparent domain gap). The slightly higher loss of nanoMoE is likely due to the fact that the model was made smaller to fit within a commodity (RTX 3090) GPU setup.
 
 If you're in a cluster environment and you are blessed with multiple GPU nodes you can make GPU go brrrr e.g. across 2 nodes like:
 
@@ -76,10 +99,10 @@ Finally, to train on a single GPU simply run the `python train.py` script. Have 
 OpenAI GPT-2 checkpoints allow us to get some baselines in place for openwebtext. We can get the numbers as follows:
 
 ```sh
-$ python train.py config/eval_gpt2.py
-$ python train.py config/eval_gpt2_medium.py
-$ python train.py config/eval_gpt2_large.py
-$ python train.py config/eval_gpt2_xl.py
+python train.py config/eval_gpt2.py
+python train.py config/eval_gpt2_medium.py
+python train.py config/eval_gpt2_large.py
+python train.py config/eval_gpt2_xl.py
 ```
 
 and observe the following losses on train and val:
@@ -95,7 +118,7 @@ However, we have to note that GPT-2 was trained on (closed, never released) WebT
 
 ## finetuning
 
-Finetuning is no different than training, we just make sure to initialize from a pretrained model and train with a smaller learning rate. 
+Finetuning is no different than training, we just make sure to initialize from a pretrained model and train with a smaller learning rate.
 
 ## sampling / inference
 
@@ -114,11 +137,11 @@ If you'd like to sample from a model you trained, use the `--out_dir` to point t
 
 Note that by default this repo uses PyTorch 2.0 (i.e. `torch.compile`). This is fairly new and experimental, and not yet available on all platforms (e.g. Windows). If you're running into related error messages try to disable this by adding `--compile=False` flag. This will slow down the code but at least it will run.
 
-For some context on this repository, GPT, and language modeling it might be helpful to watch Andrej's [Zero To Hero series](https://karpathy.ai/zero-to-hero.html). Specifically, the [GPT video](https://www.youtube.com/watch?v=kCc8FmEb1nY) is popular if you have some prior language modeling context. For context specifically on MoEs, check out the related [blog post](https://cameronrwolfe.substack.com/nano-moe) for this nanoMoE repository. 
+For some context on this repository, GPT, and language modeling it might be helpful to watch Andrej's [Zero To Hero series](https://karpathy.ai/zero-to-hero.html). Specifically, the [GPT video](https://www.youtube.com/watch?v=kCc8FmEb1nY) is popular if you have some prior language modeling context. For context specifically on MoEs, check out the related [blog post](https://cameronrwolfe.substack.com/nano-moe) for this nanoMoE repository.
 
 For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 
-[![](https://dcbadge.vercel.app/api/server/3zy8kqD9Cp?compact=true&style=flat)](https://discord.gg/3zy8kqD9Cp)
+[![Join the nanoGPT Discord](https://dcbadge.vercel.app/api/server/3zy8kqD9Cp?compact=true&style=flat)](https://discord.gg/3zy8kqD9Cp)
 
 ## acknowledgements
 
