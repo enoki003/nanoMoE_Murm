@@ -96,13 +96,31 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'auto' # 'auto', 'cpu', 'cuda', 'cuda:0', etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+
+auto_requested = (device == 'auto')
+if device == 'auto':
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if device.startswith('cuda') and not torch.cuda.is_available():
+    print("[train.py] Requested CUDA but no GPU detected. Falling back to CPU.")
+    device = 'cpu'
+if 'cuda' not in device and backend == 'nccl':
+    print("[train.py] Backend 'nccl' requires CUDA. Switching to 'gloo' for CPU training.")
+    backend = 'gloo'
+if 'cuda' not in device and dtype != 'float32':
+    print("[train.py] Forcing dtype='float32' on CPU.")
+    dtype = 'float32'
+if 'cuda' not in device and compile:
+    print("[train.py] Disabling torch.compile on CPU. Pass --compile=True to override.")
+    compile = False
+
+config.update(dict(device=device, dtype=dtype, backend=backend, compile=compile, auto_requested=auto_requested))
 print(config)
 # -----------------------------------------------------------------------------
 
@@ -113,8 +131,11 @@ if ddp:
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
+    if 'cuda' in device:
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+    else:
+        device = 'cpu'
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
@@ -132,8 +153,9 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+    torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 
 # note: float16 data type will automatically use a GradScaler
@@ -231,7 +253,23 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+if device_type == 'cuda':
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+else:
+    class _DummyGradScaler:
+        def scale(self, loss):
+            return loss
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
+        def unscale_(self, optimizer):
+            pass
+
+    scaler = _DummyGradScaler()
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)

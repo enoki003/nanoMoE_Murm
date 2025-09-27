@@ -81,6 +81,16 @@ torchrun --standalone --nproc_per_node=2 train.py config/train_nano_moe.py
 
 This will run for about 5 days using PyTorch Distributed Data Parallel (DDP) and go down to loss of ~3.35. Now, a GPT-2 model just evaluated on OWT gets a val loss of about 3.11, but if you finetune it it will come down to ~2.85 territory (due to an apparent domain gap). The slightly higher loss of nanoMoE is likely due to the fact that the model was made smaller to fit within a commodity (RTX 3090) GPU setup.
 
+##### CPU-only quickstart
+
+If you do not have access to a CUDA-capable GPU, the training script can now run fully on CPU. Use the plain Python entrypoint and request the CPU device explicitly:
+
+```powershell
+python train.py --device=cpu --compile=False --wandb_log=False
+```
+
+You can still supply any other overrides (e.g. `block_size`, `batch_size`, configs, etc.). When `--device=cpu` (or when no GPU is detected) the script automatically switches the distributed backend to `gloo`, forces `dtype=float32`, and skips `torch.compile`. Expect significantly longer runtimes compared to GPU training.
+
 If you're in a cluster environment and you are blessed with multiple GPU nodes you can make GPU go brrrr e.g. across 2 nodes like:
 
 ```sh
