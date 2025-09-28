@@ -104,6 +104,29 @@ It is a good idea to benchmark your interconnect (e.g. iperf3). In particular, i
 
 Finally, to train on a single GPU simply run the `python train.py` script. Have a look at all of its args, the script tries to be very readable, hackable and transparent. You'll most likely want to tune a number of those variables depending on your needs.
 
+#### WandB logging & routing diagnostics
+
+`train.py` now enables Weights & Biases logging by default. To avoid interactive prompts on fresh machines the script automatically falls back to offline mode when no `WANDB_API_KEY` is detected. You can switch to online sync by exporting your API key (or setting `WANDB_MODE=online`):
+
+```powershell
+# Offline (default):
+python train.py --wandb_log=True
+
+# Online:
+$env:WANDB_API_KEY = "your_wandb_api_key"
+$env:WANDB_MODE = "online"  # optional, otherwise auto-detected
+python train.py --wandb_log=True
+```
+
+Run data is stored under `wandb/` when offline (`wandb sync wandb/offline-run-...` will publish later). Every MoE layer now logs the per-expert token fraction, standard deviation, Gini coefficient, and drop fraction (if capacity clipping occurs). In the W&B UI these appear under keys such as:
+
+- `routing/layer00/expert00_fraction`
+- `routing/layer00/load_std`
+- `routing/layer00/load_gini`
+- `routing/layer00/drop_fraction`
+
+Plotting these curves over time makes routing imbalance or saturation immediately visible.
+
 ## baselines
 
 OpenAI GPT-2 checkpoints allow us to get some baselines in place for openwebtext. We can get the numbers as follows:

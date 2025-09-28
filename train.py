@@ -32,6 +32,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from manager import MANAGER
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -48,6 +49,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = True # False # disabled by default
 wandb_project = 'nano-moe'
 wandb_run_name = 'gpt2-124M-owt' + str(time.time())
+wandb_mode = os.environ.get('WANDB_MODE', None)
 
 # data
 dataset = 'openwebtext'
@@ -120,7 +122,23 @@ if 'cuda' not in device and compile:
     print("[train.py] Disabling torch.compile on CPU. Pass --compile=True to override.")
     compile = False
 
-config.update(dict(device=device, dtype=dtype, backend=backend, compile=compile, auto_requested=auto_requested))
+if decay_lr and lr_decay_iters <= warmup_iters:
+    suggested = warmup_iters + 1
+    print(
+        f"[train.py] Adjusting lr_decay_iters from {lr_decay_iters} to {suggested} to avoid division by zero (warmup_iters={warmup_iters})."
+    )
+    lr_decay_iters = suggested
+
+config.update(
+    dict(
+        device=device,
+        dtype=dtype,
+        backend=backend,
+        compile=compile,
+        auto_requested=auto_requested,
+        lr_decay_iters=lr_decay_iters,
+    )
+)
 print(config)
 # -----------------------------------------------------------------------------
 
@@ -290,6 +308,7 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
+    MANAGER.reset_routing_stats()
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -301,6 +320,7 @@ def estimate_loss():
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
+    MANAGER.reset_routing_stats()
     return out
 
 # learning rate decay scheduler (cosine with warmup)
@@ -312,7 +332,8 @@ def get_lr(it):
     if it > lr_decay_iters:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    denom = max(1, lr_decay_iters - warmup_iters)
+    decay_ratio = (it - warmup_iters) / denom
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
@@ -320,7 +341,14 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    init_kwargs = dict(project=wandb_project, name=wandb_run_name, config=config)
+    if wandb_mode is None and not os.environ.get('WANDB_API_KEY'):
+        os.environ.setdefault('WANDB_MODE', 'offline')
+        init_kwargs['mode'] = os.environ['WANDB_MODE']
+        print("[train.py] WANDB_API_KEY not found; defaulting to offline logging mode.")
+    elif wandb_mode is not None:
+        init_kwargs['mode'] = wandb_mode
+    wandb.init(**init_kwargs)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -335,6 +363,8 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    MANAGER.reset_routing_stats()
+
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
@@ -346,7 +376,7 @@ while True:
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }, step=iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -401,6 +431,22 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        routing_metrics = MANAGER.routing_summary()
+        if routing_metrics:
+            fractions = [v for k, v in routing_metrics.items() if k.endswith('_fraction')]
+            if fractions:
+                max_frac = max(fractions)
+                min_frac = min(fractions)
+                print(f"  routing balance: min {min_frac:.3f}, max {max_frac:.3f}")
+        if wandb_log:
+            log_payload = {
+                "iter": iter_num,
+                "train/iter_loss": lossf,
+                "train/iter_time_ms": dt * 1000,
+                "train/mfu": running_mfu*100,
+            }
+            log_payload.update(routing_metrics)
+            wandb.log(log_payload, step=iter_num)
     iter_num += 1
     local_iter_num += 1
 

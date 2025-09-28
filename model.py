@@ -288,8 +288,10 @@ class MLPExperts(nn.Module):
         return x
 
 class MOELayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_index: int, manager=MANAGER):
         super().__init__()
+        self.layer_index = layer_index
+        self.manager = manager
         self.router = Router(config) # (noisy) top k router
         self.experts = MLPExperts(config) # group of MLPs (experts)
 
@@ -299,6 +301,9 @@ class MOELayer(nn.Module):
 
         # pass each token through the router
         used_capacity, exp_weight, exp_mask = self.router(x)
+        if self.manager is not None and self.layer_index is not None:
+            total_expected = self.router.top_k * (B * T)
+            self.manager.add_routing_stats(self.layer_index, used_capacity, total_expected)
 
         # flatten out the input
         x = x.view(num_tokens, n_embd)
@@ -322,13 +327,14 @@ class MOELayer(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, use_moe=False):
+    def __init__(self, config, use_moe=False, layer_index=None, manager=MANAGER):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if use_moe:
-            self.mlp = MOELayer(config)
+            assert layer_index is not None, "MoE blocks require a layer index"
+            self.mlp = MOELayer(config, layer_index=layer_index, manager=manager)
         else:
             self.mlp = MLP(config)
 
@@ -372,18 +378,11 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        if config.n_exp == 1:
-            # create normal transformer blocks
-            blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        else:
-            # create transformer blocks, placing an MoE block every <stride> layers
-            blocks = []
-            for i in range(config.n_layer):
-                # TODO: how to implement this?
-                # should we change below to i + 1 ?
-                use_moe = (i % config.stride) == 0
-                blocks.append(Block(config, use_moe=use_moe))
-            blocks = nn.ModuleList(blocks)
+        blocks = []
+        for i in range(config.n_layer):
+            use_moe = config.n_exp > 1 and (i % config.stride) == 0
+            blocks.append(Block(config, use_moe=use_moe, layer_index=i, manager=MANAGER))
+        blocks = nn.ModuleList(blocks)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
