@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
+from collections import defaultdict
 # os.environ['NCCL_P2P_DISABLE'] = '1'
 # os.environ['NCCL_IGNORE_DISABLED_P2P'] = '1'
 import time
@@ -50,6 +51,8 @@ wandb_log = True # False # disabled by default
 wandb_project = 'nano-moe'
 wandb_run_name = 'gpt2-124M-owt' + str(time.time())
 wandb_mode = os.environ.get('WANDB_MODE', None)
+wandb_group = None
+wandb_tags = None
 
 # data
 dataset = 'openwebtext'
@@ -348,6 +351,13 @@ if wandb_log and master_process:
         print("[train.py] WANDB_API_KEY not found; defaulting to offline logging mode.")
     elif wandb_mode is not None:
         init_kwargs['mode'] = wandb_mode
+    if wandb_group:
+        init_kwargs['group'] = wandb_group
+    if wandb_tags:
+        if isinstance(wandb_tags, str):
+            init_kwargs['tags'] = [tag.strip() for tag in wandb_tags.split(',') if tag.strip()]
+        else:
+            init_kwargs['tags'] = list(wandb_tags)
     wandb.init(**init_kwargs)
 
 # training loop
@@ -432,12 +442,43 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         routing_metrics = MANAGER.routing_summary()
+        aggregated_metrics = {}
         if routing_metrics:
-            fractions = [v for k, v in routing_metrics.items() if k.endswith('_fraction')]
+            fractions = [v for k, v in routing_metrics.items() if k.endswith('_fraction') and 'expert' in k]
             if fractions:
                 max_frac = max(fractions)
                 min_frac = min(fractions)
                 print(f"  routing balance: min {min_frac:.3f}, max {max_frac:.3f}")
+            layer_fractions = defaultdict(list)
+            for key, value in routing_metrics.items():
+                if key.endswith('_fraction') and 'expert' in key:
+                    parts = key.split('/')
+                    if len(parts) >= 3:
+                        layer_fractions[parts[1]].append(value)
+            all_layer_values = [val for values in layer_fractions.values() for val in values]
+            if all_layer_values:
+                total_experts = len(all_layer_values)
+                unused = sum(1 for val in all_layer_values if val <= 1e-6)
+                aggregated_metrics.update(
+                    {
+                        "routing/global/fraction_min": min(all_layer_values),
+                        "routing/global/fraction_max": max(all_layer_values),
+                        "routing/global/fraction_mean": sum(all_layer_values) / total_experts,
+                        "routing/global/fraction_unused_ratio": unused / total_experts,
+                    }
+                )
+            for layer, values in layer_fractions.items():
+                total = len(values)
+                if total == 0:
+                    continue
+                unused = sum(1 for val in values if val <= 1e-6)
+                aggregated_metrics.update(
+                    {
+                        f"routing/{layer}/fraction_min": min(values),
+                        f"routing/{layer}/fraction_max": max(values),
+                        f"routing/{layer}/fraction_unused_ratio": unused / total,
+                    }
+                )
         if wandb_log:
             log_payload = {
                 "iter": iter_num,
@@ -446,6 +487,7 @@ while True:
                 "train/mfu": running_mfu*100,
             }
             log_payload.update(routing_metrics)
+            log_payload.update(aggregated_metrics)
             wandb.log(log_payload, step=iter_num)
     iter_num += 1
     local_iter_num += 1

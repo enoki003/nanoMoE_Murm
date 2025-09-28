@@ -118,14 +118,27 @@ $env:WANDB_MODE = "online"  # optional, otherwise auto-detected
 python train.py --wandb_log=True
 ```
 
-Run data is stored under `wandb/` when offline (`wandb sync wandb/offline-run-...` will publish later). Every MoE layer now logs the per-expert token fraction, standard deviation, Gini coefficient, and drop fraction (if capacity clipping occurs). In the W&B UI these appear under keys such as:
+Run data is stored under `wandb/` when offline (`wandb sync wandb/offline-run-...` will publish later). Every MoE layer now logs the per-expert token fraction, standard deviation, Gini coefficient, and drop fraction (if capacity clipping occurs). In addition, the trainer publishes aggregated summaries that make cross-run comparisons easier:
 
 - `routing/layer00/expert00_fraction`
 - `routing/layer00/load_std`
 - `routing/layer00/load_gini`
 - `routing/layer00/drop_fraction`
+- `routing/layer00/fraction_min`, `routing/layer00/fraction_max`
+- `routing/layer00/fraction_unused_ratio`
+- `routing/global/fraction_min`, `routing/global/fraction_max`
+- `routing/global/fraction_unused_ratio`
 
 Plotting these curves over time makes routing imbalance or saturation immediately visible.
+
+For a quick A/B comparison of router regularisation, two ready-made configs target the Tiny Shakespeare dataset:
+
+```powershell
+python train.py config/tiny_moe_no_reg.py   # auxiliary losses disabled
+python train.py config/tiny_moe_reg.py      # auxiliary + router z-loss enabled
+```
+
+Both configs place their runs in the shared W&B group `tiny-moe-regularization`, so the web UI automatically aligns them on the same dashboards. Track `routing/global/fraction_unused_ratio` (lower is better) or the per-layer `fraction_max` curves to quantify how strongly the router favours a single expert. Because all metrics are logged in both offline and online modes, you can repeat the commands above on disconnected machines (and later `wandb sync` the results) while still getting the full comparison view.
 
 ## baselines
 
