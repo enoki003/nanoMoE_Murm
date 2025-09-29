@@ -7,31 +7,75 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import math
+from __future__ import annotations
+
 import inspect
+import math
 from dataclasses import dataclass
 from contextlib import nullcontext
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, cast
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.optim.adamw import AdamW
+from torch.optim.optimizer import Optimizer
 
-from manager import MANAGER
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+class TypedModule(nn.Module):
+    """nn.Module subclass with a typed __init__ for Pyright."""
 
-    def __init__(self, ndim, bias):
+    def __init__(self) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+
+from manager import MANAGER, MOEManager
+
+
+class _PretrainedHFModel(Protocol):
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        ...
+
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    # MoE-related configs 
+    n_exp: int = 1 # if n_exp = 1 we just use regular MLP layers
+    top_k: int = 2
+    use_aux_loss: bool = False # apply auxiliary loss (from Switch Transformer) in router
+    use_router_z_loss: bool = False # apply router z loss (from ST-MoE)
+    use_noisy_top_k: bool = False
+    aux_loss_weight: float = 0.01 # default setting from Switch Transformer (see top of page 8)
+    router_z_loss_weight: float = 0.001 # default setting from ST-MoE (see page 8 eq. 6)
+    train_capacity: float = 1.25  # default setting from ST-MoE (see top of page 6)
+    eval_capacity: float = 2.0
+    min_capacity: int = 4  # minimum batch size to send to any single expert
+    stride: int = 2 # one in every stride layers are converted to an MoE
+    use_switch_tfm_init: bool = False  # use weight init scheme from Switch Transformer
+    switch_tfm_init_scale: float = 1.0
+    router_use_full_prec: bool = False  # use float32 precision in the router
+
+class LayerNorm(TypedModule):
+    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False."""
+
+    def __init__(self, ndim: int, bias: bool) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.weight: nn.Parameter = nn.Parameter(torch.ones(ndim))
+        self.bias: Optional[nn.Parameter] = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(TypedModule):
 
-    def __init__(self, config):
+    def __init__(self, config: 'GPTConfig') -> None:
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -49,10 +93,12 @@ class CausalSelfAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            mask = torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                1, 1, config.block_size, config.block_size
+            )
+            self.register_buffer("bias", mask)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -78,8 +124,8 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class Router(nn.Module):
-    def __init__(self, config):
+class Router(TypedModule):
+    def __init__(self, config: 'GPTConfig') -> None:
         super().__init__()
 
         # router settings
@@ -99,14 +145,22 @@ class Router(nn.Module):
         # linear projection for (noisy) softmax gating
         # no bias is used, see page 4 eq (4) in (https://arxiv.org/abs/1701.06538)
         self.w_g = nn.Linear(config.n_embd, config.n_exp, bias=False)
-        self.w_noise = nn.Linear(config.n_embd, config.n_exp, bias=False) if self.use_noisy_top_k else None
+        self.w_noise: Optional[nn.Linear] = (
+            nn.Linear(config.n_embd, config.n_exp, bias=False)
+            if self.use_noisy_top_k
+            else None
+        )
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # optionally run the router in full precision to avoid instability during training
         # see discussion on pg. 9 here: https://arxiv.org/abs/2101.03961
         # setting enabled to False in autocast automatically puts everything in float32
         device_type = 'cuda' if torch.cuda.is_available() else 'cpu' # for later use in torch.autocast
-        ctx = nullcontext() if not self.router_use_full_prec else torch.amp.autocast(device_type=device_type, enabled=False)
+        ctx = (
+            torch.autocast(device_type=device_type, enabled=False)
+            if self.router_use_full_prec
+            else nullcontext()
+        )
 
         with ctx:
             B, T, _ = x.size()
@@ -114,7 +168,7 @@ class Router(nn.Module):
 
             # eq (4) in (https://arxiv.org/abs/1701.06538)
             logits = self.w_g(x)  # [B, T, n_exp]
-            if self.use_noisy_top_k:
+            if self.use_noisy_top_k and self.w_noise is not None:
                 # optionally add noise into the router
                 noise = F.softplus(self.w_noise(x))
                 noise *= torch.randn_like(noise)
@@ -192,9 +246,9 @@ class Router(nn.Module):
             # size of tensor is [B * T, n_exp, exp_capacity]
             cb_weight = torch.sum(exp_weights.unsqueeze(3) * exp_rank_sc.unsqueeze(2), dim=0)
             sec_mask = cb_weight.bool() # binary mask of selected experts for each token
-            return used_capacity, cb_weight, sec_mask
+        return used_capacity, cb_weight, sec_mask
     
-    def compute_aux_loss(self, expert_probs: torch.Tensor, indices: torch.Tensor):
+    def compute_aux_loss(self, expert_probs: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """
         Computes Switch Transformer auxiliary loss (https://arxiv.org/abs/2101.03961)
         See equations (4)-(6) on page 7
@@ -215,7 +269,7 @@ class Router(nn.Module):
         # multiply the result by the number of experts
         return self.n_exp * torch.sum(prob_per_expert * tokens_per_expert)
     
-    def compute_router_z_loss(self, logits: torch.Tensor):
+    def compute_router_z_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Computes ST-MoE router z loss (https://arxiv.org/abs/2202.08906)
         See equation (5) on page 7
@@ -231,7 +285,7 @@ class Router(nn.Module):
         # sum over all tokens and divide by total number of tokens
         return torch.mean(z_loss)
 
-    def get_capacity(self, tokens_per_batch):
+    def get_capacity(self, tokens_per_batch: int) -> int:
         # expert capacity is given by (tokens_per_batch / num_experts) * capacity_factor
         # see eq (3) in Switch Transformer (https://arxiv.org/abs/2101.03961)
         capacity_factor = self.train_capacity if self.training else self.eval_capacity
@@ -241,61 +295,77 @@ class Router(nn.Module):
         assert capacity > 0
         return int(capacity)
 
-class MLP(nn.Module):
-    def __init__(self, config):
+class MLP(TypedModule):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.c_fc: nn.Linear = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu: nn.GELU = nn.GELU()
+        self.c_proj: nn.Linear = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout: nn.Dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
-class MLPExperts(nn.Module):
+class MLPExperts(TypedModule):
     """
     implementation of multiple MLP-based experts that can process input
     in batch -- based upon ColossalAI OpenMoE but simple, has optional bias, and
     uses a bmm instead of a loop over a mm for each expert to improve efficiency
     link: https://github.com/hpcaitech/ColossalAI/blob/main/colossalai/moe/experts.py
     """
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         # TODO: add param init
         super().__init__()
-        self.bias = config.bias
+        self.bias: bool = config.bias
 
-        self.c_fc = nn.Parameter(torch.empty(config.n_exp, config.n_embd, 4 * config.n_embd))
-        self.c_proj = nn.Parameter(torch.empty(config.n_exp, 4 * config.n_embd, config.n_embd))
-        self.fc_bias = nn.Parameter(torch.empty(config.n_exp, 1, 4 * config.n_embd)) if self.bias else None
-        self.proj_bias = nn.Parameter(torch.empty(config.n_exp, 1, config.n_embd)) if self.bias else None
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(config.dropout)
-    
+        self.c_fc: nn.Parameter = nn.Parameter(
+            torch.empty(config.n_exp, config.n_embd, 4 * config.n_embd)
+        )
+        self.c_proj: nn.Parameter = nn.Parameter(
+            torch.empty(config.n_exp, 4 * config.n_embd, config.n_embd)
+        )
+        self.fc_bias: Optional[nn.Parameter] = (
+            nn.Parameter(torch.empty(config.n_exp, 1, 4 * config.n_embd))
+            if self.bias
+            else None
+        )
+        self.proj_bias: Optional[nn.Parameter] = (
+            nn.Parameter(torch.empty(config.n_exp, 1, config.n_embd))
+            if self.bias
+            else None
+        )
+        self.gelu: nn.GELU = nn.GELU()
+        self.dropout: nn.Dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.bmm(x, self.c_fc)
-        if self.bias:
+        if self.bias and self.fc_bias is not None:
             x += self.fc_bias
         x = self.gelu(x)
         x = torch.bmm(x, self.c_proj)
-        if self.bias:
+        if self.bias and self.proj_bias is not None:
             x += self.proj_bias
         x = self.dropout(x)
         return x
 
-class MOELayer(nn.Module):
-    def __init__(self, config, layer_index: int, manager=MANAGER):
+class MOELayer(TypedModule):
+    def __init__(
+        self,
+        config: GPTConfig,
+        layer_index: Optional[int],
+        manager: Optional[MOEManager] = MANAGER,
+    ) -> None:
         super().__init__()
-        self.layer_index = layer_index
-        self.manager = manager
+        self.layer_index: Optional[int] = layer_index
+        self.manager: Optional[MOEManager] = manager
         self.router = Router(config) # (noisy) top k router
         self.experts = MLPExperts(config) # group of MLPs (experts)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, n_embd = x.size() # track original shape of input
         num_tokens = (B * T)
 
@@ -325,73 +395,61 @@ class MOELayer(nn.Module):
         # resize output before return
         return output.view(B, T, n_embd)
 
-class Block(nn.Module):
+class Block(TypedModule):
 
-    def __init__(self, config, use_moe=False, layer_index=None, manager=MANAGER):
+    def __init__(
+        self,
+        config: GPTConfig,
+        use_moe: bool = False,
+        layer_index: Optional[int] = None,
+        manager: Optional[MOEManager] = MANAGER,
+    ) -> None:
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        if use_moe:
-            assert layer_index is not None, "MoE blocks require a layer index"
-            self.mlp = MOELayer(config, layer_index=layer_index, manager=manager)
-        else:
-            self.mlp = MLP(config)
+        self.ln_1: LayerNorm = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn: CausalSelfAttention = CausalSelfAttention(config)
+        self.ln_2: LayerNorm = LayerNorm(config.n_embd, bias=config.bias)
+        self.use_moe: bool = use_moe and config.n_exp > 1
+        self.moe: Optional[MOELayer] = MOELayer(config, layer_index=layer_index, manager=manager) if self.use_moe else None
+        self.mlp: MLP = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.use_moe and self.moe is not None:
+            moe_out = self.moe(self.ln_2(x))
+        else:
+            moe_out = self.mlp(self.ln_2(x))
+        x = x + moe_out
         return x
+class GPT(TypedModule):
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
-    # MoE-related configs 
-    n_exp: int = 1 # if n_exp = 1 we just use regular MLP layers
-    top_k: int = 2
-    use_aux_loss: bool = False # apply auxiliary loss (from Switch Transformer) in router
-    use_router_z_loss: bool = False # apply router z loss (from ST-MoE)
-    use_noisy_top_k: bool = False
-    aux_loss_weight: float = 0.01 # default setting from Switch Transformer (see top of page 8)
-    router_z_loss_weight: float = 0.001 # default setting from ST-MoE (see page 8 eq. 6)
-    train_capacity: float = 1.25  # default setting from ST-MoE (see top of page 6)
-    eval_capacity: float = 2.0
-    min_capacity: int = 4  # minimum batch size to send to any single expert
-    stride: int = 2 # one in every stride layers are converted to an MoE
-    use_switch_tfm_init: bool = False  # use weight init scheme from Switch Transformer
-    switch_tfm_init_scale: float = 1.0
-    router_use_full_prec: bool = False  # use float32 precision in the router
-
-
-class GPT(nn.Module):
-
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        self.config = config
+        self.config: GPTConfig = config
 
-        blocks = []
+        blocks: list[Block] = []
         for i in range(config.n_layer):
             use_moe = config.n_exp > 1 and (i % config.stride) == 0
             blocks.append(Block(config, use_moe=use_moe, layer_index=i, manager=MANAGER))
-        blocks = nn.ModuleList(blocks)
+        block_modules = nn.ModuleList(blocks)
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = blocks,
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.wte: nn.Embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe: nn.Embedding = nn.Embedding(config.block_size, config.n_embd)
+        self.drop: nn.Dropout = nn.Dropout(config.dropout)
+        self.h: nn.ModuleList = block_modules
+        self.ln_f: LayerNorm = LayerNorm(config.n_embd, bias=config.bias)
+
+        self.transformer: nn.ModuleDict = nn.ModuleDict(
+            {
+                "wte": self.wte,
+                "wpe": self.wpe,
+                "drop": self.drop,
+                "h": self.h,
+                "ln_f": self.ln_f,
+            }
+        )
+        self.lm_head: nn.Linear = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -410,7 +468,7 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def get_num_params(self, non_embedding=True):
+    def get_num_params(self, non_embedding: bool = True) -> int:
         """
         Return the number of parameters in the model.
         For non-embedding count (default), the position embeddings get subtracted.
@@ -422,83 +480,91 @@ class GPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    @torch.no_grad()
-    def _init_weights(self, module):
-        # optionally use switch transformer-style initialization
-        # see page 10 for switch init explanation: https://arxiv.org/abs/2101.03961
-        if isinstance(module, nn.Linear):
-            if self.config.use_switch_tfm_init:
-                scale = self.config.switch_tfm_init_scale
+    def _init_weights(self, module: nn.Module) -> None:
+        with torch.no_grad():
+            # optionally use switch transformer-style initialization
+            # see page 10 for switch init explanation: https://arxiv.org/abs/2101.03961
+            if isinstance(module, nn.Linear):
+                if self.config.use_switch_tfm_init:
+                    scale = self.config.switch_tfm_init_scale
 
-                # linear layers have flipped dimensions in torch
-                # size of weights is [out_dim, in_dim] 
-                w_fan_in = module.weight.shape[-1]
-                w_std = (scale / w_fan_in) ** 0.5
-                torch.nn.init.trunc_normal_(
-                    module.weight,
-                    mean=0.0,
-                    std=w_std,
-                    a=-2*w_std,
-                    b=2*w_std,
-                )
-            else:
-                # perform standard (normal) initialization of weights
+                    # linear layers have flipped dimensions in torch
+                    # size of weights is [out_dim, in_dim] 
+                    w_fan_in = module.weight.shape[-1]
+                    w_std = (scale / w_fan_in) ** 0.5
+                    torch.nn.init.trunc_normal_(
+                        module.weight,
+                        mean=0.0,
+                        std=w_std,
+                        a=-2*w_std,
+                        b=2*w_std,
+                    )
+                else:
+                    # perform standard (normal) initialization of weights
+                    torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+                # always initialize bias to zero
+                bias: Optional[torch.Tensor] = getattr(module, "bias", None)
+                if bias is not None:
+                    torch.nn.init.zeros_(bias)
+            elif isinstance(module, MLPExperts):
+                # we have to init expert weights manually because
+                # nn.Parameter is not a type of module in torch
+                if self.config.use_switch_tfm_init:
+                    scale = self.config.switch_tfm_init_scale
+
+                    c_fc_fan_in = module.c_fc.shape[-2]
+                    c_fc_std = (scale / c_fc_fan_in) ** 0.5
+                    torch.nn.init.trunc_normal_(
+                        module.c_fc,
+                        mean=0.0,
+                        std=c_fc_std,
+                        a=-2*c_fc_std,
+                        b=2*c_fc_std,
+                    )
+
+                    c_proj_fan_in = module.c_proj.shape[-2]
+                    c_proj_std = (scale / c_proj_fan_in) ** 0.5
+                    torch.nn.init.trunc_normal_(
+                        module.c_proj,
+                        mean=0.0,
+                        std=c_proj_std,
+                        a=-2*c_proj_std,
+                        b=2*c_proj_std,
+                    )
+                else:
+                    # perform standard (normal) initialization of weights
+                    torch.nn.init.normal_(module.c_fc, mean=0.0, std=0.02)
+                    torch.nn.init.normal_(module.c_proj, mean=0.0, std=0.02)
+
+                # bias is always initialized to zero
+                fc_bias: Optional[torch.Tensor] = module.fc_bias
+                if fc_bias is not None:
+                    torch.nn.init.zeros_(fc_bias)
+                proj_bias: Optional[torch.Tensor] = module.proj_bias
+                if proj_bias is not None:
+                    torch.nn.init.zeros_(proj_bias)
+            elif isinstance(module, nn.Embedding):
+                # just use standard initialization scheme for embedding always
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-            # always initialize bias to zero
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, MLPExperts):
-            # we have to init expert weights manually because
-            # nn.Parameter is not a type of module in torch
-            if self.config.use_switch_tfm_init:
-                scale = self.config.switch_tfm_init_scale
-
-                c_fc_fan_in = module.c_fc.shape[-2]
-                c_fc_std = (scale / c_fc_fan_in) ** 0.5
-                torch.nn.init.trunc_normal_(
-                    module.c_fc,
-                    mean=0.0,
-                    std=c_fc_std,
-                    a=-2*c_fc_std,
-                    b=2*c_fc_std,
-                )
-
-                c_proj_fan_in = module.c_proj.shape[-2]
-                c_proj_std = (scale / c_proj_fan_in) ** 0.5
-                torch.nn.init.trunc_normal_(
-                    module.c_proj,
-                    mean=0.0,
-                    std=c_proj_std,
-                    a=-2*c_proj_std,
-                    b=2*c_proj_std,
-                )
-            else:
-                # perform standard (normal) initialization of weights
-                torch.nn.init.normal_(module.c_fc, mean=0.0, std=0.02)
-                torch.nn.init.normal_(module.c_proj, mean=0.0, std=0.02)
-
-            # bias is always initialized to zero
-            if module.fc_bias is not None:
-                torch.nn.init.zeros_(module.fc_bias)
-                torch.nn.init.zeros_(module.proj_bias)
-        elif isinstance(module, nn.Embedding):
-            # just use standard initialization scheme for embedding always
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         device = idx.device
-        b, t = idx.size()
+        _, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        tok_emb = self.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.drop(tok_emb + pos_emb)
+        for block in cast(Iterable[Block], self.h):
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -519,29 +585,33 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def crop_block_size(self, block_size):
+    def crop_block_size(self, block_size: int) -> None:
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+        self.wpe.weight = nn.Parameter(self.wpe.weight[:block_size])
+        for block in cast(Iterable[Block], self.h):
+            if hasattr(block.attn, 'bias') and isinstance(block.attn.bias, torch.Tensor):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert not 'moe' in model_type, "Pretrained checkpoints not available for MoE"
+    def from_pretrained(
+        cls,
+        model_type: str,
+        override_args: Optional[Dict[str, float]] = None,
+    ) -> "GPT":
+        assert 'moe' not in model_type, "Pretrained checkpoints not available for MoE"
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
+        override_args = {} if override_args is None else dict(override_args)
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+        print(f"loading weights from pretrained gpt: {model_type}")
 
         # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
+        config_args: Dict[str, Any] = {
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
             'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
@@ -563,7 +633,8 @@ class GPT(nn.Module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        load_pretrained = getattr(GPT2LMHeadModel, "from_pretrained")
+        model_hf = cast(_PretrainedHFModel, load_pretrained(model_type))
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
@@ -588,18 +659,28 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(
+        self,
+        weight_decay: float,
+        learning_rate: float,
+        betas: Tuple[float, float],
+        device_type: str,
+    ) -> Optimizer:
         # TODO: add expert config
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict: Dict[str, nn.Parameter] = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         # add an extra check for "bias" string to account for bias terms in MoE layers
-        decay_params = [p for n, p in param_dict.items() if (p.dim() >= 2 and not n.endswith('bias'))]
-        nodecay_params = [p for n, p in param_dict.items() if (p.dim() < 2 or n.endswith('bias'))]
-        optim_groups = [
+        decay_params: List[nn.Parameter] = [
+            p for n, p in param_dict.items() if (p.dim() >= 2 and not n.endswith('bias'))
+        ]
+        nodecay_params: List[nn.Parameter] = [
+            p for n, p in param_dict.items() if (p.dim() < 2 or n.endswith('bias'))
+        ]
+        optim_groups: List[Dict[str, Any]] = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
@@ -608,15 +689,15 @@ class GPT(nn.Module):
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        fused_available = 'fused' in inspect.signature(AdamW).parameters
+        use_fused = bool(fused_available and device_type == 'cuda')
+        extra_args: Dict[str, Any] = {'fused': True} if use_fused else {}
+        optimizer = AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, fwdbwd_per_iter: int, dt: float) -> float:
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
@@ -630,31 +711,38 @@ class GPT(nn.Module):
         flops_achieved = flops_per_iter * (1.0/dt) # per second
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
-        return mfu
+        return float(mfu)
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                logits, _ = self(idx_cond)
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits = logits.clone()
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx   
+        return idx

@@ -91,6 +91,16 @@ python train.py --device=cpu --compile=False --wandb_log=False
 
 You can still supply any other overrides (e.g. `block_size`, `batch_size`, configs, etc.). When `--device=cpu` (or when no GPU is detected) the script automatically switches the distributed backend to `gloo`, forces `dtype=float32`, and skips `torch.compile`. Expect significantly longer runtimes compared to GPU training.
 
+#### Smoke run
+
+Need a fast confidence check that exercises the real training path end-to-end? Launch the lightweight smoke runner which executes a dozen iterations on Tiny Shakespeare and ensures a real checkpoint is produced:
+
+```powershell
+python scripts/run_smoke.py --max-iters 10 --tee-log
+```
+
+This invokes `train.py` under the hood, writes outputs to `out/smoke`, and stores the combined console log in `out/smoke/smoke.log` when `--tee-log` is enabled. Because it relies solely on the actual training codepath, it doubles as a CI-friendly validation.
+
 If you're in a cluster environment and you are blessed with multiple GPU nodes you can make GPU go brrrr e.g. across 2 nodes like:
 
 ```sh

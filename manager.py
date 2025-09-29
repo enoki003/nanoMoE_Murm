@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict
 
 import torch
 
@@ -12,31 +12,43 @@ class MOEManager:
     losses across multiple MoE layers in the model
     """
 
-    def __init__(self):
-        self.aux_loss = []
-        self.router_z_loss = []
+    def __init__(self) -> None:
+        self.aux_loss: list[torch.Tensor] = []
+        self.router_z_loss: list[torch.Tensor] = []
         self._routing_token_counts: Dict[int, torch.Tensor] = {}
         self._routing_target_assignments: Dict[int, float] = {}
         self._routing_calls: Dict[int, int] = defaultdict(int)
+        self._aux_loss_device: torch.device | None = None
+        self._aux_loss_dtype: torch.dtype | None = None
+        self._router_loss_device: torch.device | None = None
+        self._router_loss_dtype: torch.dtype | None = None
     
-    def reset_aux_loss(self):
+    def reset_aux_loss(self) -> None:
         self.aux_loss = []
+        self._aux_loss_device = None
+        self._aux_loss_dtype = None
     
-    def reset_router_z_loss(self):
+    def reset_router_z_loss(self) -> None:
         self.router_z_loss = []
+        self._router_loss_device = None
+        self._router_loss_dtype = None
 
-    def reset_routing_stats(self):
+    def reset_routing_stats(self) -> None:
         self._routing_token_counts = {}
         self._routing_target_assignments = {}
         self._routing_calls = defaultdict(int)
     
-    def add_aux_loss(self, loss):
+    def add_aux_loss(self, loss: torch.Tensor) -> None:
         self.aux_loss.append(loss)
+        self._aux_loss_device = loss.device
+        self._aux_loss_dtype = loss.dtype
     
-    def add_router_z_loss(self, loss):
+    def add_router_z_loss(self, loss: torch.Tensor) -> None:
         self.router_z_loss.append(loss)
+        self._router_loss_device = loss.device
+        self._router_loss_dtype = loss.dtype
 
-    def add_routing_stats(self, layer_idx: int, used_capacity: torch.Tensor, target_assignments: int):
+    def add_routing_stats(self, layer_idx: int, used_capacity: torch.Tensor, target_assignments: int) -> None:
         """Track how many (possibly weighted) tokens each expert processed.
 
         Args:
@@ -57,11 +69,19 @@ class MOEManager:
 
         self._routing_calls[layer_idx] += 1
     
-    def aggregate_aux_loss(self):
-        return sum(self.aux_loss)
+    def aggregate_aux_loss(self) -> torch.Tensor:
+        if not self.aux_loss:
+            device = self._aux_loss_device if self._aux_loss_device is not None else torch.device('cpu')
+            dtype = self._aux_loss_dtype if self._aux_loss_dtype is not None else torch.float32
+            return torch.zeros((), device=device, dtype=dtype)
+        return torch.stack(self.aux_loss).sum()
 
-    def aggregate_router_z_loss(self):
-        return sum(self.router_z_loss)
+    def aggregate_router_z_loss(self) -> torch.Tensor:
+        if not self.router_z_loss:
+            device = self._router_loss_device if self._router_loss_device is not None else torch.device('cpu')
+            dtype = self._router_loss_dtype if self._router_loss_dtype is not None else torch.float32
+            return torch.zeros((), device=device, dtype=dtype)
+        return torch.stack(self.router_z_loss).sum()
 
     def routing_summary(self) -> Dict[str, float]:
         """Return scalar metrics describing the router load balance per layer."""
@@ -75,7 +95,9 @@ class MOEManager:
 
             fractions = (counts / max(total_assignments, 1e-6)).to(torch.float32)
             layer_tag = f"layer{layer_idx:02d}"
-            for expert_idx, frac in enumerate(fractions.tolist()):
+            fractions_flat = fractions.flatten()
+            for expert_idx in range(fractions_flat.numel()):
+                frac = float(fractions_flat[expert_idx].item())
                 summary[f"routing/{layer_tag}/expert{expert_idx:02d}_fraction"] = frac
 
             summary[f"routing/{layer_tag}/load_std"] = float(fractions.std(unbiased=False))
