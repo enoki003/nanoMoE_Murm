@@ -13,7 +13,7 @@ import inspect
 import math
 from dataclasses import dataclass
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Protocol, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -22,11 +22,18 @@ from torch.optim.adamw import AdamW
 from torch.optim.optimizer import Optimizer
 
 
-class TypedModule(nn.Module):
-    """nn.Module subclass with a typed __init__ for Pyright."""
+if TYPE_CHECKING:
+    class _TypedModuleBase(nn.Module):
+        def __init__(self) -> None: ...
+else:
+    _TypedModuleBase = nn.Module
+
+
+class TypedModule(_TypedModuleBase):
+    """Small helper to keep Pyright happy when calling ``nn.Module.__init__``."""
 
     def __init__(self) -> None:
-        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        super().__init__()
 
 from manager import MANAGER, MOEManager
 
@@ -90,6 +97,7 @@ class CausalSelfAttention(TypedModule):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.bias: Optional[torch.Tensor] = None
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -97,6 +105,7 @@ class CausalSelfAttention(TypedModule):
                 1, 1, config.block_size, config.block_size
             )
             self.register_buffer("bias", mask)
+            self.bias = mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -114,7 +123,9 @@ class CausalSelfAttention(TypedModule):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            bias = self.bias
+            assert bias is not None
+            att = att.masked_fill(bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -454,7 +465,7 @@ class GPT(TypedModule):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lm_head.weight = self.wte.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         # optionall use switch transformer special init scheme for experts
@@ -477,7 +488,7 @@ class GPT(TypedModule):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            n_params -= self.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module: nn.Module) -> None:
